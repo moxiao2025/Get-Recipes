@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "getrecipes",
+  "version": "${version}",
+  "name": "Get Recipes",
+  "description": "Unlocks every recipe in the recipe book. Works fully in singleplayer, on servers running this mod, and shows every local recipe in the book on vanilla servers (ghost-placement preview included).",
+  "authors": [],
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.recipe.GetRecipes"
+    ],
+    "client": [
+      "com.recipe.GetRecipes"
+    ]
+  },
+  "mixins": [
+    "getrecipes.mixins.json",
+    "getrecipes.client.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "minecraft": "~${minecraft_version}",
+    "java": ">=25"
+  }
+}

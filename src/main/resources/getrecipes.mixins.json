@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "package": "com.recipe.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "minVersion": "0.8",
+  "mixins": [
+    "RecipeManagerAccessor",
+    "ServerRecipeBookMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

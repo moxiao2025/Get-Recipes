@@ -1,0 +1,15 @@
+{
+  "required": true,
+  "package": "com.recipe.mixin.client",
+  "compatibilityLevel": "JAVA_25",
+  "minVersion": "0.8",
+  "client": [
+    "ClientPacketListenerMixin",
+    "ClientRecipeBookAccessor",
+    "ClientRecipeBookMixin",
+    "RecipeBookComponentMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
