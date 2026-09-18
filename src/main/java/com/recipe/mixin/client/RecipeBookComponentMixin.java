@@ -15,11 +15,13 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * 因此在原版发包流程之后，于客户端本地直接展示幽灵配方（材料摆放提示），
  * 行为与服务端在材料不足时回传 ClientboundPlaceGhostRecipePacket 一致。
  * 服务器已安装本 mod 时，所有条目都由服务端下发（低位 ID），不会触发这里。
+ * 注：tryPlaceRecipe 是 26.2 引入的方法，26.1 不存在。设为 require = 0，
+ * 在缺失该方法的版本上静默跳过，不影响配方展示主功能。
  */
 @Mixin(RecipeBookComponent.class)
 public abstract class RecipeBookComponentMixin {
 
-	@Inject(method = "tryPlaceRecipe", at = @At("RETURN"))
+	@Inject(method = "tryPlaceRecipe", at = @At("RETURN"), require = 0)
 	private void getrecipes$showGhostRecipeForLocalEntry(
 		final RecipeCollection collection, final RecipeDisplayId recipe, final boolean useMaxItems,
 		final CallbackInfoReturnable<Boolean> cir

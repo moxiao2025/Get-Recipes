@@ -5,6 +5,7 @@ import com.recipe.mixin.RecipeManagerAccessor;
 import com.recipe.mixin.client.ClientRecipeBookAccessor;
 import net.minecraft.client.ClientRecipeBook;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.recipebook.RecipeUpdateListener;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.core.HolderLookup;
@@ -193,8 +194,28 @@ public final class LocalRecipeUnlocker {
 		if (connection != null && client.level != null) {
 			connection.searchTrees().updateRecipes(book, client.level);
 		}
-		if (client.gui.screen() instanceof RecipeUpdateListener listener) {
+		Screen current = getCurrentScreen(client);
+		if (current instanceof RecipeUpdateListener listener) {
 			listener.recipesUpdated();
+		}
+	}
+
+	/**
+	 * 跨版本取得当前打开的界面。
+	 * 26.1：Minecraft.screen 字段；26.2+：Gui.screen() 方法，Minecraft.screen 已移除。
+	 */
+	private static Screen getCurrentScreen(final Minecraft client) {
+		try {
+			return (Screen) client.gui.getClass().getMethod("screen").invoke(client.gui);
+		} catch (NoSuchMethodException ignored) {
+			// 26.1 路径
+		} catch (ReflectiveOperationException e) {
+			return null;
+		}
+		try {
+			return (Screen) Minecraft.class.getField("screen").get(client);
+		} catch (ReflectiveOperationException e) {
+			return null;
 		}
 	}
 
