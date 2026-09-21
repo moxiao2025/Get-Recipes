@@ -156,7 +156,13 @@ public final class LocalRecipeUnlocker {
 	}
 
 	/**
-	 * 将本地配方合并进指定的客户端配方书，已存在（按语义内容判重）的条目跳过。
+	 * 将本地配方合并进指定的客户端配方书。
+	 * 每次重建时做一次完整对账：
+	 * <ul>
+	 *   <li>移除"已被服务器真实条目覆盖"的本地幽灵副本——处理进服后服务器增量解锁
+	 *       （ClientboundRecipeBookAddPacket, replace=false）带来的重复；</li>
+	 *   <li>补入服务器仍未解锁的本地配方。</li>
+	 * </ul>
 	 * 在客户端主线程随 ClientRecipeBook#rebuildCollections 一起调用。
 	 */
 	public static void mergeInto(final ClientRecipeBook book) {
@@ -168,8 +174,31 @@ public final class LocalRecipeUnlocker {
 
 		Map<RecipeDisplayId, RecipeDisplayEntry> known =
 			((ClientRecipeBookAccessor) book).getrecipes$getKnown();
-		int serverEntriesBefore = known.size();
 
+		// 1. 收集服务器真实条目的语义签名（服务器下发的 ID 均为低位索引）
+		Set<String> serverSigs = new HashSet<>(known.size() * 2);
+		known.values().forEach(entry -> {
+			if (entry.id().index() < LOCAL_RECIPE_ID_BASE) {
+				serverSigs.add(semanticSignature(entry));
+			}
+		});
+
+		// 2. 移除已被服务器真实条目覆盖的本地幽灵条目
+		//    （本地 ID 为 LOCAL_RECIPE_ID_BASE + 在 entries 中的下标，可直接定位预计算签名）
+		int removed = 0;
+		var it = known.entrySet().iterator();
+		while (it.hasNext()) {
+			Map.Entry<RecipeDisplayId, RecipeDisplayEntry> kv = it.next();
+			int localIndex = kv.getKey().index() - LOCAL_RECIPE_ID_BASE;
+			if (localIndex >= 0
+				&& localIndex < localSigs.size()
+				&& serverSigs.contains(localSigs.get(localIndex))) {
+				it.remove();
+				removed++;
+			}
+		}
+
+		// 3. 按语义内容补入服务器仍未解锁的本地配方
 		Set<String> existing = new HashSet<>(known.size() * 2);
 		known.values().forEach(entry -> existing.add(semanticSignature(entry)));
 
@@ -186,10 +215,10 @@ public final class LocalRecipeUnlocker {
 			book.add(entry);
 			added++;
 		}
-		if (added > 0) {
+		if (removed > 0 || added > 0) {
 			GetRecipes.LOGGER.info(
-				"GetRecipes: merged {} local recipes into the client recipe book ({} entries already known from the server)",
-				added, serverEntriesBefore
+				"GetRecipes: reconciled local recipes ({} added, {} ghost cop(ies) replaced by server-unlocked entries)",
+				added, removed
 			);
 		}
 	}
