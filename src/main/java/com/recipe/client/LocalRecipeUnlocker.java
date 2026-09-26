@@ -19,6 +19,7 @@ import net.minecraft.server.packs.resources.ResourceManager;
 import net.minecraft.util.Util;
 import net.minecraft.world.flag.FeatureFlagSet;
 import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStackTemplate;
 import net.minecraft.world.item.crafting.GetRecipesLocalLoader;
 import net.minecraft.world.item.crafting.RecipeManager;
 import net.minecraft.world.item.crafting.display.RecipeDisplay;
@@ -34,6 +35,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 
 /**
  * 纯客户端的全配方解锁逻辑（不依赖 Fabric API、不依赖服务器是否安装本 mod）。
@@ -57,8 +59,10 @@ public final class LocalRecipeUnlocker {
 	public static final int LOCAL_RECIPE_ID_BASE = 0x40000000;
 
 	private static volatile List<RecipeDisplayEntry> entries = List.of();
-	/** 与 {@link #entries} 一一对应的预计算语义签名（在 IO 线程生成）。 */
+	/** 与 {@link #entries} 一一对应的预计算严格签名（在 IO 线程生成）。 */
 	private static volatile List<String> entrySignatures = List.of();
+	/** 与 {@link #entries} 一一对应的预计算宽松身份签名（服务端变体兜底，IO 线程生成）。 */
+	private static volatile List<String> entryLooseSignatures = List.of();
 
 	private LocalRecipeUnlocker() {
 	}
@@ -71,6 +75,7 @@ public final class LocalRecipeUnlocker {
 		// 立刻丢弃上一次连接的数据，避免重连完成前被误用
 		entries = List.of();
 		entrySignatures = List.of();
+		entryLooseSignatures = List.of();
 
 		final Minecraft client = Minecraft.getInstance();
 
@@ -99,6 +104,7 @@ public final class LocalRecipeUnlocker {
 		Util.ioPool().execute(() -> {
 			List<RecipeDisplayEntry> loaded = List.of();
 			List<String> loadedSignatures = List.of();
+			List<String> loadedLooseSignatures = List.of();
 			try {
 				int jsonFiles = dataResources.listResources("recipe", location -> location.getPath().endsWith(".json")).size();
 				GetRecipes.LOGGER.info("GetRecipes: found {} recipe JSON file(s) under the data section", jsonFiles);
@@ -130,6 +136,7 @@ public final class LocalRecipeUnlocker {
 				loaded = result;
 				// 签名涉及反射，放在 IO 线程预计算，主线程合并时直接使用
 				loadedSignatures = result.stream().map(LocalRecipeUnlocker::semanticSignature).toList();
+				loadedLooseSignatures = result.stream().map(LocalRecipeUnlocker::looseSignature).toList();
 				GetRecipes.LOGGER.info("GetRecipes: loaded {} recipe displays from local data packs", result.size());
 			} catch (RuntimeException e) {
 				GetRecipes.LOGGER.error("GetRecipes: failed to load local recipes for the client recipe book", e);
@@ -137,9 +144,11 @@ public final class LocalRecipeUnlocker {
 
 			final List<RecipeDisplayEntry> finalLoaded = loaded;
 			final List<String> finalSignatures = loadedSignatures;
+			final List<String> finalLooseSignatures = loadedLooseSignatures;
 			client.execute(() -> {
 				entries = finalLoaded;
 				entrySignatures = finalSignatures;
+				entryLooseSignatures = finalLooseSignatures;
 				if (!finalLoaded.isEmpty()) {
 					refreshRecipeBook(client);
 				}
@@ -163,11 +172,17 @@ public final class LocalRecipeUnlocker {
 	 *       （ClientboundRecipeBookAddPacket, replace=false）带来的重复；</li>
 	 *   <li>补入服务器仍未解锁的本地配方。</li>
 	 * </ul>
+	 * 匹配分两层：先严格签名（完整结构相等），失败再用宽松身份签名
+	 * （分类 + 工作台 + 结果物 + 材料多重集合，忽略形状/槽位包装/顺序），
+	 * 以兼容服务端插件（如 CraftEngine）或协议翻译重建出的、结构略有差异的同一条配方：
+	 * 例如服务端把材料槽统一生成为 ItemStackSlotDisplay(count=1)、把物品标签提前展开
+	 * 为具体物品枚举，而本地数据包解析为 ItemSlotDisplay / TagSlotDisplay。
 	 * 在客户端主线程随 ClientRecipeBook#rebuildCollections 一起调用。
 	 */
 	public static void mergeInto(final ClientRecipeBook book) {
 		List<RecipeDisplayEntry> local = entries;
 		List<String> localSigs = entrySignatures;
+		List<String> localLooseSigs = entryLooseSignatures;
 		if (local.isEmpty() || localSigs.isEmpty() || Minecraft.getInstance().getSingleplayerServer() != null) {
 			return;
 		}
@@ -175,50 +190,58 @@ public final class LocalRecipeUnlocker {
 		Map<RecipeDisplayId, RecipeDisplayEntry> known =
 			((ClientRecipeBookAccessor) book).getrecipes$getKnown();
 
-		// 1. 收集服务器真实条目的语义签名（服务器下发的 ID 均为低位索引）
-		Set<String> serverSigs = new HashSet<>(known.size() * 2);
+		// 1. 收集服务器真实条目的两层签名（服务器下发的 ID 均为低位索引）
+		Set<String> serverStrict = new HashSet<>(known.size() * 2);
+		Set<String> serverLoose = new HashSet<>(known.size() * 2);
 		known.values().forEach(entry -> {
 			if (entry.id().index() < LOCAL_RECIPE_ID_BASE) {
-				serverSigs.add(semanticSignature(entry));
+				serverStrict.add(semanticSignature(entry));
+				serverLoose.add(looseSignature(entry));
 			}
 		});
 
 		// 2. 移除已被服务器真实条目覆盖的本地幽灵条目
 		//    （本地 ID 为 LOCAL_RECIPE_ID_BASE + 在 entries 中的下标，可直接定位预计算签名）
-		int removed = 0;
+		int removedStrict = 0;
+		int removedLoose = 0;
 		var it = known.entrySet().iterator();
 		while (it.hasNext()) {
 			Map.Entry<RecipeDisplayId, RecipeDisplayEntry> kv = it.next();
 			int localIndex = kv.getKey().index() - LOCAL_RECIPE_ID_BASE;
-			if (localIndex >= 0
-				&& localIndex < localSigs.size()
-				&& serverSigs.contains(localSigs.get(localIndex))) {
+			if (localIndex < 0 || localIndex >= localSigs.size()) {
+				continue;
+			}
+			if (serverStrict.contains(localSigs.get(localIndex))) {
 				it.remove();
-				removed++;
+				removedStrict++;
+			} else if (serverLoose.contains(localLooseSigs.get(localIndex))) {
+				it.remove();
+				removedLoose++;
 			}
 		}
 
 		// 3. 按语义内容补入服务器仍未解锁的本地配方
-		Set<String> existing = new HashSet<>(known.size() * 2);
-		known.values().forEach(entry -> existing.add(semanticSignature(entry)));
+		Set<String> existingStrict = new HashSet<>(known.size() * 2);
+		known.values().forEach(entry -> existingStrict.add(semanticSignature(entry)));
 
 		int added = 0;
 		for (int i = 0; i < local.size(); i++) {
 			RecipeDisplayEntry entry = local.get(i);
-			// ID 冲突防御 + 按语义内容去重（服务器也装了本 mod 时，其下发的条目语义相同）
-			if (known.containsKey(entry.id())) {
-				continue;
-			}
-			if (!existing.add(localSigs.get(i))) {
+			// ID 冲突防御 + 两层签名去重（服务器也装了本 mod，或经协议翻译时同样能命中）
+			if (known.containsKey(entry.id())
+				|| existingStrict.contains(localSigs.get(i))
+				|| serverLoose.contains(localLooseSigs.get(i))) {
 				continue;
 			}
 			book.add(entry);
+			existingStrict.add(localSigs.get(i));
 			added++;
 		}
+		int removed = removedStrict + removedLoose;
 		if (removed > 0 || added > 0) {
 			GetRecipes.LOGGER.info(
-				"GetRecipes: reconciled local recipes ({} added, {} ghost cop(ies) replaced by server-unlocked entries)",
-				added, removed
+				"GetRecipes: reconciled local recipes ({} added, {} ghost cop(ies) replaced by server-unlocked entries, {} via loose identity)",
+				added, removed, removedLoose
 			);
 		}
 	}
@@ -471,5 +494,161 @@ public final class LocalRecipeUnlocker {
 				}
 				return String.valueOf(value);
 			});
+	}
+
+	// ----------------------------------------------------------------------------------
+	// 宽松身份签名
+	//
+	// 用于跨协议翻译场景（如 ViaFabricPlus 接入旧版服务器）：旧协议的配方经翻译重建为
+	// RecipeDisplayEntry 时，槽位包装方式（单个物品是否包一层 Composite）、有序/无序、
+	// 槽位顺序等表现形式可能与本地解析结果不同，但"配方身份"不变。
+	//
+	// 身份仅取：分类 + 工作台 + 结果物 + 材料多重集合（每个槽位是一组"或"选项，
+	// 槽位之间不计顺序）。不同产物 / 不同工作台 / 不同材料集合的配方仍然可区分。
+	// ----------------------------------------------------------------------------------
+
+	private static String looseSignature(final RecipeDisplayEntry entry) {
+		RecipeDisplay display = entry.display();
+		Set<String> resultTokens = new TreeSet<>();
+		Set<String> stationTokens = new TreeSet<>();
+		List<Set<String>> ingredientSlots = new ArrayList<>();
+
+		if (display.getClass().isRecord()) {
+			for (RecordComponent component : display.getClass().getRecordComponents()) {
+				Object value;
+				try {
+					value = component.getAccessor().invoke(display);
+				} catch (ReflectiveOperationException e) {
+					continue;
+				}
+				String name = component.getName();
+				if (value instanceof SlotDisplay slotDisplay) {
+					Set<String> tokens = flattenSlot(slotDisplay);
+					if ("result".equals(name)) {
+						resultTokens.addAll(tokens);
+					} else if ("craftingStation".equals(name)) {
+						stationTokens.addAll(tokens);
+					} else {
+						// 其余槽位（ingredient/input/template/base/addition/fuel 等）一律视为材料
+						ingredientSlots.add(tokens);
+					}
+				} else if (value instanceof List<?> list
+					&& (list.isEmpty() || list.get(0) instanceof SlotDisplay)) {
+					for (Object element : list) {
+						ingredientSlots.add(flattenSlot((SlotDisplay) element));
+					}
+				}
+			}
+		}
+
+		// 每个槽位内部排序（或选项无序），槽位之间再排序（忽略摆放位置/顺序）
+		List<String> slotKeys = new ArrayList<>(ingredientSlots.size());
+		for (Set<String> slot : ingredientSlots) {
+			slotKeys.add(String.join("|", slot));
+		}
+		slotKeys.sort(null);
+
+		Object categoryName = BuiltInRegistries.RECIPE_BOOK_CATEGORY.getKey(entry.category());
+		return "cat=" + categoryName
+			+ "|st=" + String.join("|", stationTokens)
+			+ "|res=" + String.join("|", resultTokens)
+			+ "|ing=" + String.join(";;", slotKeys);
+	}
+
+	/**
+	 * 将一个槽位展开为一组物品/标签 token（槽位内是"或"关系）。
+	 * token 形式：i:物品id（可带 *数量）、t:标签id、#燃料、p:纹饰id。
+	 */
+	private static Set<String> flattenSlot(final SlotDisplay display) {
+		Set<String> tokens = new TreeSet<>();
+		flattenSlot(display, tokens);
+		return tokens;
+	}
+
+	private static void flattenSlot(final SlotDisplay display, final Set<String> tokens) {
+		if (display == null || display instanceof SlotDisplay.Empty) {
+			return;
+		}
+		if (display instanceof SlotDisplay.AnyFuel) {
+			tokens.add("#fuel");
+			return;
+		}
+		if (display instanceof SlotDisplay.ItemSlotDisplay d) {
+			tokens.add("i:" + holderKey(d.item()));
+			return;
+		}
+		if (display instanceof SlotDisplay.TagSlotDisplay d) {
+			// 归一化：把标签展开为成员物品，使"标签槽"与服务端"显式枚举同标签成员"的
+			// Composite 槽视为同一槽位（部分服务端会提前把标签展开成具体物品列表）
+			int before = tokens.size();
+			BuiltInRegistries.ITEM.getTagOrEmpty(d.tag())
+				.forEach(holder -> tokens.add("i:" + holderKey(holder)));
+			if (tokens.size() == before) {
+				tokens.add("t:" + d.tag().location());
+			}
+			return;
+		}
+		if (display instanceof SlotDisplay.ItemStackSlotDisplay d) {
+			ItemStackTemplate stack = d.stack();
+			// count=1 时省略数量，与 ItemSlotDisplay 归一化（部分服务端把所有材料槽
+			// 统一生成为 ItemStackSlotDisplay(count=1)，而本地数据包解析为 ItemSlotDisplay）
+			String token = "i:" + holderKey(stack.item());
+			if (stack.count() != 1) {
+				token += "*" + stack.count();
+			}
+			// 非空组件必须参与身份：部分服务端用原版物品 + custom_data 伪装自定义物品，
+			// 若忽略组件会与本地同基础物品的原版配方误合并
+			if (stack.components().size() > 0) {
+				token += "@" + Integer.toHexString(stack.components().toString().hashCode());
+			}
+			tokens.add(token);
+			return;
+		}
+		if (display instanceof SlotDisplay.Composite d) {
+			for (SlotDisplay content : d.contents()) {
+				flattenSlot(content, tokens);
+			}
+			return;
+		}
+		if (display instanceof SlotDisplay.WithRemainder d) {
+			// 容器残留物（如桶）不参与配方身份
+			flattenSlot(d.input(), tokens);
+			return;
+		}
+		if (display instanceof SlotDisplay.WithAnyPotion d) {
+			flattenSlot(d.display(), tokens);
+			return;
+		}
+		if (display instanceof SlotDisplay.OnlyWithComponent d) {
+			flattenSlot(d.source(), tokens);
+			tokens.add("@" + BuiltInRegistries.DATA_COMPONENT_TYPE.getKey(d.component()));
+			return;
+		}
+		if (display instanceof SlotDisplay.DyedSlotDemo d) {
+			flattenSlot(d.target(), tokens);
+			flattenSlot(d.dye(), tokens);
+			return;
+		}
+		if (display instanceof SlotDisplay.SmithingTrimDemoSlotDisplay d) {
+			flattenSlot(d.base(), tokens);
+			flattenSlot(d.material(), tokens);
+			tokens.add("p:" + holderKey(d.pattern()));
+			return;
+		}
+		// 未知槽位类型（新版本）：反射展开其中的 SlotDisplay / Holder 组件，尽量保持兼容
+		if (display.getClass().isRecord()) {
+			for (RecordComponent component : display.getClass().getRecordComponents()) {
+				try {
+					Object value = component.getAccessor().invoke(display);
+					if (value instanceof SlotDisplay slotDisplay) {
+						flattenSlot(slotDisplay, tokens);
+					} else if (value instanceof Holder<?> holder) {
+						tokens.add("h:" + holderKey(holder));
+					}
+				} catch (ReflectiveOperationException ignored) {
+					// 无法访问的组件忽略
+				}
+			}
+		}
 	}
 }
