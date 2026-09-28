@@ -1,7 +1,6 @@
 package com.recipe.client;
 
 import com.recipe.GetRecipes;
-import com.recipe.mixin.RecipeManagerAccessor;
 import com.recipe.mixin.client.ClientRecipeBookAccessor;
 import net.minecraft.client.ClientRecipeBook;
 import net.minecraft.client.Minecraft;
@@ -10,6 +9,7 @@ import net.minecraft.client.gui.screens.recipebook.RecipeUpdateListener;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.core.Holder;
 import net.minecraft.core.HolderLookup;
+import net.minecraft.core.HolderSet;
 import net.minecraft.core.component.DataComponentPatch;
 import net.minecraft.core.component.DataComponentType;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -17,6 +17,7 @@ import net.minecraft.server.packs.PackResources;
 import net.minecraft.server.packs.PackType;
 import net.minecraft.server.packs.resources.MultiPackResourceManager;
 import net.minecraft.server.packs.resources.ResourceManager;
+import net.minecraft.tags.TagKey;
 import net.minecraft.util.Util;
 import net.minecraft.world.flag.FeatureFlagSet;
 import net.minecraft.world.item.Item;
@@ -124,19 +125,14 @@ public final class LocalRecipeUnlocker {
 			List<String> loadedLooseSignatures = List.of();
 			List<String> loadedCoarseSignatures = List.of();
 			try {
-				int jsonFiles = dataResources.listResources("recipe", location -> location.getPath().endsWith(".json")).size();
-				GetRecipes.LOGGER.info("GetRecipes: found {} recipe JSON file(s) under the data section", jsonFiles);
-
-				RecipeManager recipeManager = new RecipeManager(registries);
-				int[] counts = GetRecipesLocalLoader.loadSilently(recipeManager, dataResources, registries);
-				recipeManager.finalizeRecipeLoading(features);
+				GetRecipesLocalLoader.LoadResult load =
+					GetRecipesLocalLoader.loadSilently(dataResources, registries, features);
 				GetRecipes.LOGGER.info(
-					"GetRecipes: parsed {} local recipe(s) ({} skipped: missing items/tags this server does not have)",
-					counts[0], counts[1]
+					"GetRecipes: parsed {} local recipe(s) from {} JSON file(s) ({} skipped: missing items/tags this server does not have)",
+					load.loaded(), load.found(), load.failed()
 				);
 
-				List<RecipeManager.ServerDisplayInfo> displays =
-					((RecipeManagerAccessor) (Object) recipeManager).getrecipes$getAllDisplays();
+				List<RecipeManager.ServerDisplayInfo> displays = load.displays();
 				List<RecipeDisplayEntry> result = new ArrayList<>(displays.size());
 				int index = 0;
 				for (RecipeManager.ServerDisplayInfo info : displays) {
@@ -451,7 +447,7 @@ public final class LocalRecipeUnlocker {
 			return sb.append("item{").append(holderKey(d.item())).append('}');
 		}
 		if (display instanceof SlotDisplay.TagSlotDisplay d) {
-			return sb.append("tag{").append(d.tag().location()).append('}');
+			return sb.append("tag{").append(tagIdentity(tagOf(d))).append('}');
 		}
 		if (display instanceof SlotDisplay.Composite d) {
 			sb.append("composite[");
@@ -538,6 +534,55 @@ public final class LocalRecipeUnlocker {
 				}
 				return String.valueOf(value);
 			});
+	}
+
+	/** TagSlotDisplay#tag() 访问器反射缓存（26.1 返回 TagKey，26.3 返回 HolderSet）。 */
+	private static volatile java.lang.reflect.Method tagSlotAccessor;
+
+	/**
+	 * 反射读取 TagSlotDisplay 的 tag 组件。
+	 * 不能直接调用 d.tag()：方法描述符含返回类型，26.1 编译出的字节码在 26.3
+	 * （返回类型改为 HolderSet）上会抛 NoSuchMethodError。
+	 */
+	private static Object tagOf(final SlotDisplay.TagSlotDisplay display) {
+		try {
+			java.lang.reflect.Method accessor = tagSlotAccessor;
+			if (accessor == null) {
+				accessor = SlotDisplay.TagSlotDisplay.class.getMethod("tag");
+				tagSlotAccessor = accessor;
+			}
+			return accessor.invoke(display);
+		} catch (ReflectiveOperationException e) {
+			throw new IllegalStateException("GetRecipes: TagSlotDisplay#tag unavailable", e);
+		}
+	}
+
+	/**
+	 * TagSlotDisplay 的标签身份。26.1/26.2 记录 TagKey，26.3 起改为直接记录
+	 * HolderSet（网络侧同标签的 Named 集合取其标签键；无标签的 Direct 集合
+	 * 退化为成员列表）。
+	 */
+	private static String tagIdentity(final Object tag) {
+		if (tag instanceof TagKey<?> key) {
+			return key.location().toString();
+		}
+		if (tag instanceof HolderSet<?> set) {
+			return set.unwrapKey()
+				.map(key -> key.location().toString())
+				.orElseGet(() -> {
+					StringBuilder members = new StringBuilder("direct[");
+					boolean first = true;
+					for (Object element : (Iterable<?>) set) {
+						if (!first) {
+							members.append(',');
+						}
+						first = false;
+						members.append(element instanceof Holder<?> holder ? holderKey(holder) : String.valueOf(element));
+					}
+					return members.append(']').toString();
+				});
+		}
+		return String.valueOf(tag);
 	}
 
 	// ----------------------------------------------------------------------------------
@@ -676,9 +721,15 @@ public final class LocalRecipeUnlocker {
 			return "";
 		}
 		StringBuilder sb = new StringBuilder();
-		for (Map.Entry<DataComponentType<?>, Optional<?>> kv : components.entrySet()) {
-			String keyName = String.valueOf(BuiltInRegistries.DATA_COMPONENT_TYPE.getKey(kv.getKey()));
-			String valueText = kv.getValue().map(String::valueOf).orElse("removed");
+		for (Map.Entry<?, ?> kv : patchEntries(components)) {
+			String keyName = String.valueOf(
+				BuiltInRegistries.DATA_COMPONENT_TYPE.getKey((DataComponentType<?>) kv.getKey())
+			);
+			Object raw = kv.getValue();
+			// 26.1/26.2 的 patch 值为 Optional（empty 表示删除组件），26.3 起为原始组件值
+			String valueText = raw instanceof Optional<?> optional
+				? optional.map(String::valueOf).orElse("removed")
+				: String.valueOf(raw);
 			if ("minecraft:custom_data".equals(keyName)) {
 				valueText = VIA_CUSTOM_DATA_NOISE.matcher(valueText).replaceAll("");
 				if ("{}".equals(valueText.trim())) {
@@ -688,6 +739,21 @@ public final class LocalRecipeUnlocker {
 			sb.append(keyName).append('=').append(valueText).append(';');
 		}
 		return sb.length() == 0 ? "" : Integer.toHexString(sb.toString().hashCode());
+	}
+
+	/**
+	 * 遍历 DataComponentPatch 的 (组件类型, 值) 条目。
+	 * 26.1/26.2 提供公开的 entrySet()；26.3 起移除，仅保留包私有字段 map
+	 * （fastutil Reference2ObjectMap，两版本字段名一致），统一走反射读取。
+	 */
+	private static List<Map.Entry<?, ?>> patchEntries(final DataComponentPatch components) {
+		try {
+			java.lang.reflect.Field field = DataComponentPatch.class.getDeclaredField("map");
+			field.setAccessible(true);
+			return new ArrayList<>(((Map<?, ?>) field.get(components)).entrySet());
+		} catch (ReflectiveOperationException e) {
+			return List.of();
+		}
 	}
 
 	/**
@@ -725,12 +791,27 @@ public final class LocalRecipeUnlocker {
 		}
 		if (display instanceof SlotDisplay.TagSlotDisplay d) {
 			// 归一化：把标签展开为成员物品，使"标签槽"与服务端"显式枚举同标签成员"的
-			// Composite 槽视为同一槽位（部分服务端会提前把标签展开成具体物品列表）
+			// Composite 槽视为同一槽位（部分服务端会提前把标签展开成具体物品列表）。
+			// 26.1/26.2 记录 TagKey，26.3 起改为直接记录 HolderSet，按运行期类型解包。
+			// 必须反射取该访问器：26.1 编译出的字节码描述符写死返回 TagKey，
+			// 在 26.3 上直接调用会因描述符不匹配抛 NoSuchMethodError。
+			Object tag = tagOf(d);
 			int before = tokens.size();
-			BuiltInRegistries.ITEM.getTagOrEmpty(d.tag())
-				.forEach(holder -> tokens.add("i:" + holderKey(holder)));
-			if (tokens.size() == before) {
-				tokens.add("t:" + d.tag().location());
+			if (tag instanceof TagKey<?> key) {
+				BuiltInRegistries.ITEM.getTagOrEmpty((TagKey<Item>) key)
+					.forEach(holder -> tokens.add("i:" + holderKey(holder)));
+				if (tokens.size() == before) {
+					tokens.add("t:" + key.location());
+				}
+			} else if (tag instanceof HolderSet<?> set) {
+				for (Object element : (Iterable<?>) set) {
+					if (element instanceof Holder<?> holder) {
+						tokens.add("i:" + holderKey(holder));
+					}
+				}
+				if (tokens.size() == before) {
+					set.unwrapKey().ifPresent(key -> tokens.add("t:" + key.location()));
+				}
 			}
 			return;
 		}
